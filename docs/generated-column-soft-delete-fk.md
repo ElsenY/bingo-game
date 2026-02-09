@@ -382,6 +382,179 @@ safely become `NULL`.
 
 ---
 
+---
+
+## Pros and Cons Analysis
+
+### Pros (Why This Pattern Is Powerful)
+
+1. **True database-level integrity** — The biggest win. No amount of application bugs,
+   race conditions, direct SQL scripts, or future developer mistakes can create orphaned
+   active records. The database itself is the last line of defense, and this pattern makes
+   it work with soft deletes the same way it works with hard deletes.
+
+2. **Zero changes to application read/write logic** — Your app still inserts and queries
+   using the original `id` and `organization_id` columns. The generated columns are
+   invisible to normal operations. You don't need to rewrite queries, change ORM models
+   (beyond ignoring the generated columns), or alter API contracts.
+
+3. **NULL semantics work perfectly here** — SQL was designed so that NULL foreign key
+   values are "not checked." This is the exact behavior we want: soft-deleted rows
+   (where the generated column is NULL) should be invisible to FK enforcement. We're
+   not fighting the database — we're working *with* its existing semantics.
+
+4. **UNIQUE index only covers active rows** — In PostgreSQL, `CREATE UNIQUE INDEX` on a
+   nullable column ignores NULLs. This means the index is smaller (only active rows) and
+   there's no conflict when multiple rows are soft-deleted. This is a free partial index.
+
+5. **Minimal storage overhead** — A stored generated BIGINT column adds 8 bytes per row.
+   For a million-row table, that's ~8 MB. Negligible.
+
+6. **Restore/un-delete is naturally safe** — Setting `deleted_at = NULL` on a child row
+   automatically re-populates `active_parent_id`, and the FK check fires immediately.
+   If the parent is still deleted, the restore fails. You can't accidentally un-delete
+   a child into an inconsistent state.
+
+7. **Works with existing soft-delete libraries** — Libraries like Paranoid (Sequelize),
+   acts_as_paranoid (Rails), or SoftDeletes (Laravel) don't need modification. They
+   only touch `deleted_at`, and the generated columns react automatically.
+
+8. **Composable** — Works with composite keys, multi-level hierarchies, and can be
+   added incrementally to existing tables via ALTER TABLE.
+
+### Cons (The Real Costs)
+
+1. **Schema complexity / "WTF factor"** — Every soft-deletable table with FK
+   relationships needs 1-2 extra columns. A new developer looking at the schema sees
+   `active_id`, `active_organization_id`, etc. and has to understand *why* they exist.
+   This is non-obvious and requires documentation. In a schema with 50 tables and
+   dozens of FK relationships, the generated columns add real visual noise.
+
+2. **ORM support is poor** — No major ORM (Prisma, TypeORM, Sequelize, Django ORM,
+   ActiveRecord, SQLAlchemy) has first-class support for generated columns. You'll need:
+   - Raw SQL migrations (can't use the ORM's migration builder)
+   - `@ignore` / `readonly` annotations so the ORM doesn't try to INSERT/UPDATE them
+   - Schema introspection tools may get confused
+   - This is the single biggest practical obstacle for most teams.
+
+3. **Ordering constraint on soft-delete operations** — You **must** soft-delete children
+   before parents. This is the same constraint as hard deletes (without ON DELETE CASCADE),
+   but developers used to soft deletes often expect to delete in any order because "it's
+   just setting a timestamp." This pattern enforces discipline that may feel surprising.
+   You can mitigate this with cascade triggers, but that adds more complexity.
+
+4. **Ordering constraint on restore operations** — You must restore parents before
+   children. Same logic, reversed. If a user clicks "undo" on a deleted child, and
+   the parent is still deleted, it fails. Your UI/API needs to handle this gracefully.
+
+5. **No native `ON DELETE CASCADE` equivalent** — With hard-delete FKs, you get
+   `ON DELETE CASCADE` for free. With generated-column FKs, cascading soft-deletes
+   requires custom triggers (shown in the "Cascade Soft Deletes" section above).
+   These triggers need to be maintained and tested.
+
+6. **Cannot use `ON DELETE SET NULL` or `ON UPDATE CASCADE`** — Generated columns
+   can't be written to by FK cascade actions. The database will reject attempts to
+   define cascade actions on FKs that target generated columns. You're limited to
+   `NO ACTION` / `RESTRICT` behavior (which is arguably what you want, but it
+   removes flexibility).
+
+7. **PostgreSQL doesn't support virtual (non-stored) generated columns** — The
+   generated column must be `STORED`, meaning it physically occupies disk space
+   and is recomputed on every INSERT/UPDATE to the row. In practice the overhead
+   is tiny, but it's not free.
+
+8. **MySQL version dependency** — FK on stored generated columns requires MySQL 8.0.13+.
+   Older versions silently ignore or reject it. SQLite doesn't support FK on generated
+   columns at all (requires triggers as a workaround).
+
+9. **Migration on large existing tables can be expensive** — Adding a stored generated
+   column to a table with hundreds of millions of rows requires a full table rewrite
+   in PostgreSQL (no online DDL for generated columns). In MySQL, `ALTER TABLE` with
+   `ALGORITHM=INPLACE` may work but still takes a lock. Plan for downtime or use
+   tools like `pg_repack` / `pt-online-schema-change`.
+
+10. **Partial index alternative may be simpler in some cases** — If you only need to
+    prevent *inserting* children that reference deleted parents (not prevent deleting
+    parents with active children), a partial unique index + CHECK constraint may
+    suffice without generated columns. See alternatives below.
+
+---
+
+## Is It Good Practice?
+
+**Short answer: Yes, it's a legitimate and well-regarded pattern — but it's not always
+the *right* choice.** Here's a decision framework:
+
+### Use generated-column FKs when:
+
+- **Data integrity is critical** and you can't tolerate application-level bugs causing
+  orphans (financial systems, healthcare, multi-tenant platforms).
+- **Multiple services or scripts** write to the database, and you can't trust all of
+  them to enforce soft-delete consistency.
+- **Your team is comfortable with raw SQL migrations** and doesn't rely entirely on
+  ORM-generated schemas.
+- **The table has moderate FK relationships** (not dozens of FKs per table).
+
+### Consider alternatives when:
+
+- **You're prototyping** or in early development — the schema complexity isn't worth it yet.
+- **Your ORM is the only writer** and you have strong application-level validation with
+  good test coverage.
+- **You have very few FK relationships** — a simple application-level check may suffice.
+- **You're using a database that doesn't support it well** (SQLite, older MySQL).
+- **You might move away from soft deletes** — if you're considering event sourcing,
+  audit tables, or temporal tables, the generated-column approach locks you deeper
+  into the soft-delete pattern.
+
+### Industry perspective
+
+This pattern is used in production by teams at companies like GitLab (which has
+discussed it for their PostgreSQL-backed Rails app) and is recommended in database
+design literature when soft deletes are a firm requirement. It's not "clever hackery"
+— it's a principled use of SQL semantics. However, it's not universally adopted because:
+- Most applications never enforce FK integrity on soft deletes at all (they just accept the risk)
+- The ORM ecosystem hasn't caught up
+- Many teams prefer application-level enforcement for flexibility
+
+---
+
+## Alternatives Comparison
+
+| Approach | DB-enforced? | Complexity | ORM support | Handles restore? | Cascade? |
+|----------|-------------|------------|-------------|-----------------|----------|
+| **Generated column FK** (this guide) | Yes | Medium | Poor (raw SQL) | Yes (naturally) | Via triggers |
+| **Application-level checks** | No | Low | Native | Manual | Manual |
+| **CHECK constraint + partial index** | Partial | Low | Poor | No | No |
+| **Row-level security (RLS)** | Sort of | High | Poor | No | No |
+| **Triggers only (no generated cols)** | Yes | High | Poor | Yes | Yes |
+| **Separate archive/history table** | N/A (data moves) | Medium | Varies | Manual move-back | N/A |
+| **Temporal tables (SQL:2011)** | Yes | High | Poor | Built-in | Built-in |
+
+### Brief notes on each alternative:
+
+**Application-level checks**: Easiest to implement. Use middleware, model hooks, or
+service-layer validation. Vulnerable to race conditions and bypasses (direct SQL,
+migrations, other services). Fine for low-risk data.
+
+**CHECK + partial index**: You can create a partial unique index like
+`CREATE UNIQUE INDEX ON users (organization_id) WHERE deleted_at IS NULL` but this only
+enforces uniqueness, not referential integrity to the parent. You'd still need triggers
+or application code to verify the parent is active.
+
+**Triggers only**: You can achieve the same result with BEFORE INSERT/UPDATE/DELETE
+triggers without generated columns. This is more flexible but harder to maintain,
+harder to reason about, and triggers can have performance implications on bulk operations.
+
+**Separate archive table**: Instead of soft-deleting in place, move deleted rows to a
+`organizations_archive` table. The original table retains normal FK constraints. This is
+clean but doubles your table count and complicates queries that need to include deleted data.
+
+**Temporal tables**: SQL:2011 temporal tables (supported in MariaDB, SQL Server; partially
+in PostgreSQL via extensions) provide system-versioned rows with automatic history. This
+is the "proper" solution but has limited database support and high complexity.
+
+---
+
 ## Performance Considerations
 
 | Aspect | Impact | Notes |
@@ -391,21 +564,18 @@ safely become `NULL`.
 | Read performance | No impact | Can be indexed normally |
 | Index size | UNIQUE index excludes NULLs | Efficient — only active rows indexed |
 | Existing queries | No changes needed | Generated columns are transparent |
+| FK check on soft-delete | Adds a lookup | Same as any FK check on UPDATE |
 
 ---
 
-## Key Benefits
+## Summary
 
-1. **Database-enforced integrity** — No race conditions, no application bugs can create orphans.
-2. **Transparent** — Existing queries using `id` and `organization_id` work unchanged.
-3. **NULL-safe** — Soft-deleted rows' FKs become NULL, so they're ignored by FK checks.
-4. **UNIQUE-safe** — Multiple soft-deleted rows with `active_id = NULL` don't violate uniqueness.
-5. **Zero application changes** — Only the schema changes; your app still reads/writes `id` and `organization_id`.
+The generated-column pattern for soft-delete FK enforcement is a **sound, principled
+technique** that leverages standard SQL semantics (NULL FK values, UNIQUE index NULL
+handling, stored generated columns) to solve a real problem. Its main costs are schema
+complexity and poor ORM tooling.
 
-## Key Gotchas
-
-1. **Order of operations matters** — Soft-delete children before parents (or use cascade triggers).
-2. **Un-delete (restore)** — Restoring a child will fail if the parent is still deleted. Restore parent first.
-3. **Generated columns can't be written to** — They're computed automatically; `INSERT`/`UPDATE` must not include them.
-4. **ORM support varies** — Most ORMs (Prisma, TypeORM, Sequelize) need raw SQL migrations for generated columns. Mark the columns as `@ignore` or equivalent in your schema.
-5. **PostgreSQL stored generated columns can't reference other tables** — The expression can only reference the current row's columns.
+**If data integrity matters and you're comfortable with raw SQL migrations, use it.**
+If you're in a fast-moving early-stage codebase with a single ORM writer and good test
+coverage, application-level checks may be more pragmatic for now — but consider
+adopting this pattern as the system matures.
